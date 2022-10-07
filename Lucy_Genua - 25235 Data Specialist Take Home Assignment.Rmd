@@ -1,0 +1,417 @@
+---
+title: "Data Specialist Take-Home Job Assessment"
+author: "Lucy Genua"
+date: '2022-10-07'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+###Set up
+
+#####Packages
+
+Load the packages necessary to execute the analyses.
+
+```{r packages, echo=TRUE }
+
+library(opendatatoronto)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(stringr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(sf)
+library(tmap)
+library(nngeo)
+
+```
+
+###Import data
+
+#####Neighbourhood boundaries
+
+For more information, visit the Open Data portal: https://open.toronto.ca/dataset/neighbourhoods/
+
+I am using the 'historical' neighbourhood boundaries (n=140) because the 2016 census neighbourhood profile data corresponds to these geographies.
+
+```{r neighbourhoods, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+neighbourhoods<-show_package("neighbourhoods") %>% list_package_resources() %>% 
+  filter(name=="Neighbourhoods - historical 140 - 2952.zip") %>% 
+  get_resource() 
+
+neighb_alpha<-neighbourhoods %>% 
+  arrange(FIELD_7)
+neighb_alpha<-c(neighb_alpha$FIELD_7)
+
+```
+
+#####Neighbourhood profiles
+
+I am using 2016 census data for neighbourhood socio-demographics. For more information, visit the Open Data portal: https://open.toronto.ca/dataset/neighbourhood-profiles/
+
+```{r profiles, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+neighbourhood_profiles<-show_package("6e19a90f-971c-46b3-852c-0c48c436d1fc") %>% list_package_resources() %>% 
+  filter(name=="neighbourhood-profiles-2016-140-model.csv") %>% 
+  get_resource() %>% 
+  filter(X_id %in% c("3","12","58","60","1121","1126","1336","1337","1628","1630")) %>% 
+  mutate(variable=c("total_population","age_25to54","apt_denominator","apt_5storeys", "limat_denominator","limat", "vismin_denominator","vismin","renter_denominator","renter")) %>% 
+  select(-X_id, -Category, -Topic, -Data.Source, -Characteristic)
+
+neighb_prof<-neighbourhood_profiles %>% 
+  gather("neighbourhood","value",1:141) %>% 
+  mutate(value = gsub(",", "", value)) %>% 
+  mutate(value=as.numeric(value)) %>% 
+  filter(neighbourhood!="City.of.Toronto") %>% 
+  spread("variable", "value") %>% 
+  mutate(neighbourhood_2=c(neighb_alpha)) %>% 
+  mutate(p_age_25to54=100*age_25to54/total_population,
+         p_apt_5storeys=100*apt_5storeys/apt_denominator,
+         p_limat=100*limat/limat_denominator,
+         p_vismin=100*vismin/vismin_denominator,
+         p_renter=100*renter/renter_denominator)
+
+```
+
+#####Address points
+
+I am going to use the city's one address repository to geocode the parking ticket locations. For more information, visit the Open Data portal: https://open.toronto.ca/dataset/address-points-municipal-toronto-one-address-repository/
+
+```{r address, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+address_points<-show_package("abedd8bc-e3dd-4d45-8e69-79165a76e4fa") %>% 
+  list_package_resources() %>% 
+  filter(name=="Municipal address points (wgs84) - shapefile") %>% 
+  get_resource() %>% 
+  st_transform("EPSG:2952") %>% 
+  mutate(street_address=str_to_upper(paste(ADDRESS,LFNAME))) %>% 
+  group_by(street_address) %>% 
+  mutate(n_geoids=n_distinct(GEO_ID)) %>% 
+  st_join(neighbourhoods, left=TRUE)
+
+unique(address_points$n_geoids) #Some street addresses have 2 or 3 spatial data points
+```
+
+#####Green P parking
+
+For more information, visit the Open Data portal: https://open.toronto.ca/dataset/green-p-parking/
+
+```{r green p, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+greenp<-show_package("b66466c3-69c8-4825-9c8b-04b270069193") %>% 
+  list_package_resources() %>% 
+  filter(name=="green-p-parking-2019") %>% 
+  get_resource()
+greenp<-greenp$carparks
+
+greenp<-st_as_sf(greenp, coords=c("lng","lat"), crs=4326) %>% 
+  st_transform("EPSG:2952")
+
+```
+
+#####TTC stops
+
+For more information, visit the Open Data portal: https://open.toronto.ca/dataset/ttc-routes-and-schedules/
+
+```{r ttc, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+ttc<-show_package("7795b45e-e65a-4465-81fc-c36b9dfff169") %>% 
+  list_package_resources() %>% 
+  filter(name=="TTC Routes and Schedules Data") %>% 
+  get_resource()
+
+```
+
+I am not able to access these data via API. I will load in a copy from my local computer instead (downloaded on 2022/10/06).
+
+```{r ttc2, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+stops<-read_csv("~/Downloads/stops.csv")
+stops<-st_as_sf(stops, coords=c("stop_lon","stop_lat"), crs=4326) %>% 
+  st_transform("EPSG:2952")
+
+```
+
+#####Parking tickets (2016-2020)
+
+For more information, visit the Open Data portal: https://open.toronto.ca/dataset/parking-tickets/
+
+```{r tickets, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+pt_20<-show_package("8c233bc2-1879-44ff-a0e4-9b69a9032c54") %>% 
+  list_package_resources() %>% 
+  filter(name=="parking-tickets-2020") %>% 
+  get_resource()
+
+pt_19<-show_package("8c233bc2-1879-44ff-a0e4-9b69a9032c54") %>% 
+  list_package_resources() %>% 
+  filter(name=="parking-tickets-2019") %>% 
+  get_resource()
+
+pt_18<-show_package("8c233bc2-1879-44ff-a0e4-9b69a9032c54") %>% 
+  list_package_resources() %>% 
+  filter(name=="parking-tickets-2018") %>% 
+  get_resource()
+
+```
+
+The warning message means that there is an end-of-file (EOF) character within a quoted string in this file. Upon further investigation, I discovered the issue is with Upon investigation, there is an issue with "Parking_Tags_Data_2018_1.csv". When accessing the file via API, only 365,322 records are imported. There should be 750,000. I will bring a copy of this file in from my local computer instead (downloaded 2022/10/05). Specifically, I will use the read_csv function (read.csv causes the same problem).
+
+```{r tickets2, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+Parking_Tags_Data_2018_1<-read_csv("~/Downloads/parking-tickets-2018/Parking_Tags_Data_2018_1.csv")
+
+pt_17<-show_package("8c233bc2-1879-44ff-a0e4-9b69a9032c54") %>% 
+  list_package_resources() %>% 
+  filter(name=="parking-tickets-2017") %>% 
+  get_resource()
+
+pt_16<-show_package("8c233bc2-1879-44ff-a0e4-9b69a9032c54") %>% 
+  list_package_resources() %>% 
+  filter(name=="parking-tickets-2016") %>% 
+  get_resource()
+
+pt<-rbind(pt_20$Parking_Tags_Data_2020.000.csv,
+          pt_20$Parking_Tags_Data_2020.001.csv,
+          pt_20$Parking_Tags_Data_2020.002.csv,
+          pt_20$Parking_Tags_Data_2020.003.csv,
+          pt_20$Parking_Tags_Data_2020.004.csv,
+          pt_20$Parking_Tags_Data_2020.005.csv,
+          pt_19$Parking_Tags_Data_2019.000.csv,
+          pt_19$Parking_Tags_Data_2019.001.csv,
+          pt_19$Parking_Tags_Data_2019.002.csv,
+          pt_19$Parking_Tags_Data_2019.003.csv,
+          pt_19$Parking_Tags_Data_2019.004.csv,
+          pt_19$Parking_Tags_Data_2019.005.csv,
+          pt_19$Parking_Tags_Data_2019.006.csv,
+          pt_19$Parking_Tags_Data_2019.007.csv,
+          pt_19$Parking_Tags_Data_2019.008.csv,
+          Parking_Tags_Data_2018_1,
+          pt_18$Parking_Tags_Data_2018_2.csv,
+          pt_18$Parking_Tags_Data_2018_3.csv,
+          pt_17$Parking_Tags_Data_2017_1.csv,
+          pt_17$Parking_Tags_Data_2017_2.csv,
+          pt_17$Parking_Tags_Data_2017_3.csv,
+          pt_16$Parking_Tags_Data_2016_1.csv,
+          pt_16$Parking_Tags_Data_2016_2.csv,
+          pt_16$Parking_Tags_Data_2016_3.csv,
+          pt_16$Parking_Tags_Data_2016_4.csv) %>% 
+  mutate(format_date=ymd(date_of_infraction)) %>% 
+  mutate(day_of_week=wday(format_date, label=TRUE, abbr=TRUE),
+         year=year(format_date))
+
+```
+
+```{r}
+#Free up memory
+rm(pt_16, pt_17, pt_18, pt_19, pt_20)
+gc()
+```
+
+
+####Geocode parking tickets
+
+The parking ticket data only includes the street address or the intersection; it does not include any additional information such as the former municipality (e.g. Etobicoke, Scarborough, etc.) or the ward. 
+
+Some street addresses that are repeated across the city. For example, there is a 1 Byng Street in Etobicoke, North York, and Scarborough. If 1 Byng Street appears in the parking ticket data, we would not be able to tell which of those 3 points it is meant to be. Therefore, for the sake of this spatial analysis, I will exclude the parking ticket street addresses that have multiple matches in the City's address repository, since we don't know where those parking tickets actually happened. 
+
+```{r parking spatial, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+pt_address<-inner_join(pt, (address_points %>% filter(n_geoids<2)), by=c("location2"="street_address"))
+
+pt_address_spatial<-inner_join((address_points %>% filter(n_geoids<2)), pt, by=c("street_address"="location2"))
+
+nrow(pt_address)/nrow(pt) 
+
+```
+
+83% of the tickets could be geocoded based on their street address.
+
+###Top 20 infraction types by frequency (3.3)
+
+```{r top 20 by freq, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+infrac_by_freq<-pt %>% 
+  group_by(infraction_description) %>% 
+  summarize(tickets=n()) %>% 
+  arrange(-tickets) %>% 
+  head(20)
+
+top_20_freq<-c(infrac_by_freq$infraction_description)
+
+knitr::kable(infrac_by_freq, "simple", col.names = c("Infraction Type", "Total Number of Tickets"), caption="Top 20 infraction types according to ticket frequency (2016-2020)")
+```
+
+###Top 20 infraction types by revenue (3.4)
+
+```{r top 20 by rev, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+infrac_by_rev<-pt %>% 
+  group_by(infraction_description) %>% 
+  summarize(revenue=sum(set_fine_amount, na.rm=TRUE)) %>% 
+  arrange(-revenue) %>% 
+  head(20)
+
+top_20_rev<-c(infrac_by_rev$infraction_description)
+
+knitr::kable(infrac_by_rev, "simple", col.names = c("Infraction Type", "Total Revenue ($)"), caption="Top 20 infraction types according to total revenue (2016-2020)")
+```
+
+###Distribution of tickets by day of week (3.5)
+
+```{r temporal, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+day_of_week_summary<-pt %>% 
+  group_by(day_of_week) %>% 
+  summarize(tickets=n()) %>% 
+  mutate(proportion=tickets/sum(tickets)) %>% 
+  mutate(percent_label=percent(proportion, accuracy=1))
+
+ggplot(day_of_week_summary, aes(x=day_of_week, y=proportion))+
+  geom_col()+
+  geom_text(aes(label=percent_label), vjust=-0.2)+
+  theme_bw()+
+  scale_y_continuous(labels=percent, limits=c(0,0.2))+
+  xlab("Day")+
+  ylab("Percentage of parking tickets (%)")+
+  ggtitle("Distribution of all parking tickets (2016-2020)\nby day of week")
+
+```
+Sunday is the day with the least parking tickets (10%). More tickets are received on Tuesdays, Wednesdays, Thursdays, and Fridays, with each accounting for 16% of the total parking tickets.
+
+###Top 20 ticket locations (3.6)
+
+```{r top 20 locations, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+top20_address_summary<-pt_address %>% 
+  group_by(location2) %>% 
+  summarize(tickets=n()) %>% 
+  arrange(-tickets) %>% 
+  head(20)
+top20_address<-right_join(address_points, top20_address_summary, by=c("street_address"="location2"))
+
+knitr::kable(top20_address_summary, "simple", col.names = c("Address", "Total Number of Tickets"), caption="Top 20 infraction locations (2016-2020)")
+
+tmap_mode("view")
+tm_shape(top20_address)+
+  tm_symbols(size="tickets", col="tickets", alpha=0.4, id="street_address")+
+  tm_layout(title="Top 20 infraction locations by ticket frequency (2016-2020)")+
+  tm_view(view.legend.position = c("right","bottom"))
+
+```
+The top three addresses with the most parking tickets from 2016-2020 are: 2075 Bayview Ave, 1265 Military Trail, and 15 Marine Parade Dr. 
+
+###Average revenue by neighbourhood (3.7)
+
+```{r neighbourhood revenue, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+neighb_pt_summary<-pt_address %>% 
+  group_by(FIELD_7) %>% 
+  summarize(avg_revenue=mean(set_fine_amount, na.rm=TRUE),
+            total_revenue=sum(set_fine_amount, na.rm=TRUE),
+            tickets=n())
+
+neighb_pt<-left_join(neighbourhoods, neighb_pt_summary, by="FIELD_7")
+
+tmap_mode("view")
+tm_shape(neighb_pt)+
+  tm_polygons(col="avg_revenue", id="FIELD_8")+
+  tm_layout(title="Average ticket value (%) by neighbourhood (2016-2020)")+
+  tm_view(view.legend.position = c("right","bottom"))
+
+```
+
+###Distance to closest Green P (3.8) and TTC stop (3.9)
+
+```{r distance, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+greenp_nn<-st_nn(pt_address_spatial, greenp, returnDist=TRUE, progress=FALSE)
+
+greenp_distances<-sapply(greenp_nn[[2]], "[", 1)
+
+ttc_nn<-st_nn(pt_address_spatial, stops, returnDist=TRUE, progress=FALSE)
+
+ttc_distances<-sapply(ttc_nn[[2]], "[", 1)
+
+distance_summary<-pt_address %>% 
+  mutate(greenp_nn_metres=c(greenp_distances),
+         ttc_nn_metres=c(ttc_distances)) %>% 
+  filter(infraction_description %in% top_20_freq) %>% 
+  group_by(infraction_description) %>% 
+  summarize(greenp_average=mean(greenp_nn_metres, na.rm=TRUE),
+            greenp_min=min(greenp_nn_metres, na.rm=TRUE),
+            greenp_max=max(greenp_nn_metres, na.rm=TRUE),
+            ttc_average=mean(ttc_nn_metres, na.rm=TRUE),
+            ttc_min=min(ttc_nn_metres, na.rm=TRUE),
+            ttc_max=max(ttc_nn_metres, na.rm=TRUE))
+
+
+knitr::kable((distance_summary %>% select(infraction_description, greenp_average, greenp_min, greenp_max)), "simple", col.names = c("Infraction Type", "Average Distance", "Min Distance", "Max Distance"), caption="Euclidean distance (metres) to nearest Green P parking for the top 20 most common infraction types (2016-2020)")
+
+knitr::kable((distance_summary %>% select(infraction_description, ttc_average, ttc_min, ttc_max)), "simple", col.names = c("Infraction Type", "Average Distance", "Min Distance", "Max Distance"), caption="Euclidean distance (metres) to nearest TTC stop  for the top 20 most common infraction types (2016-2020)")
+
+```
+Average distances to the nearest Green P or TTC stop are lowest for infractions of the type "PARKING MACH-NOT USED/NO FEE" and highest for the type "PARK FAIL TO DISPLAY RECEIPT".
+
+###Socio-demographic trends (3.10)
+
+I will look at the correlation between a selection of socio-demographic variables and the total number of tickets by neighbourhood. 
+
+#####Working age population (25 to 54)
+
+```{r working age, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+ggplot(data=neighb_pt_prof, aes(x=p_age_25to54, y=tickets))+
+  geom_point()+
+  geom_smooth(method=lm)
+
+workingage_lm<-lm(tickets~p_age_25to54, data=neighb_pt_prof)
+summary(workingage_lm)
+plot(workingage_lm)
+
+cor.test(neighb_pt_prof$p_age_25to54, neighb_pt_prof$tickets, method="spearman", exact=FALSE)
+
+```
+Simple linear regression was used to test if the proportion of residents that are working age (25-54) significantly predicted the number of parking tickets in a neighbourhood. The overall regression was statistically significant (R^2^ = 0.39, p < 0.001). It was found that higher proportions of working age people correlate with higher number of parking tickets (p <0.001). 
+
+#####Apartment dwellings 5 or more storeys
+
+```{r apartments, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+ggplot(data=neighb_pt_prof, aes(x=p_apt_5storeys, y=tickets))+
+  geom_point()+
+  geom_smooth(method=lm)
+
+apt_lm<-lm(tickets~p_apt_5storeys, data=neighb_pt_prof)
+summary(apt_lm)
+plot(apt_lm)
+
+cor.test(neighb_pt_prof$p_apt_5storeys, neighb_pt_prof$tickets, method="spearman", exact=FALSE)
+
+```
+
+Simple linear regression was used to test if the proportion of dwellings that are apartments 5+ storeys significantly predicted the number of parking tickets in a neighbourhood. The overall regression was statistically significant (R^2^ = 0.11, p < 0.001). It was found that higher proportions of apartments correlate with higher number of parking tickets (p <0.001).
+
+#####Prevalence of low income based on the low income measure, after tax (LIM-AT)
+
+```{r low income, eval=TRUE, echo=TRUE, warning=TRUE, error=TRUE}
+
+ggplot(data=neighb_pt_prof, aes(x=p_limat, y=tickets))+
+  geom_point()+
+  geom_smooth(method=lm)
+
+limat_lm<-lm(tickets~p_limat, data=neighb_pt_prof)
+summary(limat_lm)
+plot(limat_lm)
+
+cor.test(neighb_pt_prof$p_limat, neighb_pt_prof$tickets, method="spearman", exact=FALSE)
+
+```
+
+There is not a significant correlation between prevalence of low income and the number of parking tickets in a neighbourhood.
